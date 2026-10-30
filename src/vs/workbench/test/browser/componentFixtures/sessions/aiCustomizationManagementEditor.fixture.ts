@@ -1112,7 +1112,7 @@ interface IRenderEditorOptions {
 	readonly otherSourceEnabled?: boolean;
 	readonly toggleMarketplaceVisibility?: boolean;
 	readonly customizationMarketplaceState?: 'ready' | 'empty' | 'error' | 'loading' | 'loadingMore';
-	readonly customizationMarketplaceInstallationState?: 'mixed' | 'missing' | 'error';
+	readonly customizationMarketplaceInstallationState?: 'mixed' | 'missing' | 'error' | 'requiredPlugin';
 	readonly customizationMarketplaceDetailState?: 'missing' | 'error' | 'unavailable';
 	readonly useRealConnectorInstallService?: boolean;
 	readonly discoveryQuery?: string;
@@ -1279,6 +1279,15 @@ async function renderEditor(ctx: ComponentFixtureContext, options: IRenderEditor
 		customizationMarketplaceInstallStates.set(getCustomizationMarketplaceResourceKey(customizationMarketplaceResources[1]), { kind: 'installed', target: getFixtureInstallationTarget(customizationMarketplaceResources[1]) });
 	} else if (options.customizationMarketplaceInstallationState === 'missing') {
 		customizationMarketplaceInstallStates.set(getCustomizationMarketplaceResourceKey(customizationMarketplaceResources[0]), { kind: 'missing', target: getFixtureInstallationTarget(customizationMarketplaceResources[0]) });
+	}
+	const requiredPluginResource = customizationMarketplaceResources.find(resource => resource.identifier === 'example/figma-plugin')!;
+	const requiredPluginUri = URI.file('/user/plugins/figma-plugin');
+	const requiredPluginTarget: CustomizationMarketplaceInstallationTarget = { kind: 'plugin', uri: requiredPluginUri };
+	const fixturePlugins = options.customizationMarketplaceInstallationState === 'requiredPlugin'
+		? [...installedPlugins, makeInstalledPlugin('Figma', requiredPluginUri, true, false, true)]
+		: installedPlugins;
+	if (options.customizationMarketplaceInstallationState === 'requiredPlugin') {
+		customizationMarketplaceInstallStates.set(getCustomizationMarketplaceResourceKey(requiredPluginResource), { kind: 'installed', target: requiredPluginTarget });
 	}
 	if (options.customizationMarketplaceDetailState) {
 		const resource = customizationMarketplaceResources[0];
@@ -1886,7 +1895,7 @@ async function renderEditor(ctx: ComponentFixtureContext, options: IRenderEditor
 			reg.defineInstance(IAgentPluginRepositoryService, createMockAgentPluginRepositoryService());
 			reg.defineInstance(IPluginGitService, new class extends mock<IPluginGitService>() { }());
 			reg.defineInstance(IAgentPluginService, new class extends mock<IAgentPluginService>() {
-				override readonly plugins = constObservable(installedPlugins);
+				override readonly plugins = constObservable(fixturePlugins);
 				override readonly enablementModel = undefined as never;
 			}());
 			reg.defineInstance(IPluginMarketplaceService, new class extends mock<IPluginMarketplaceService>() {
@@ -2599,7 +2608,7 @@ async function renderMcpBrowseMode(ctx: ComponentFixtureContext): Promise<void> 
 // Plugin Browse Mode — standalone widget with marketplace results
 // ============================================================================
 
-function makeInstalledPlugin(name: string, uri: URI, enablement: boolean | ContributionEnablementState, policyBlocked = false): IAgentPlugin {
+function makeInstalledPlugin(name: string, uri: URI, enablement: boolean | ContributionEnablementState, policyBlocked = false, policyRequired = false): IAgentPlugin {
 	const contributionName = name.toLowerCase().replace(/\s+/g, '-');
 	const enablementState = typeof enablement === 'boolean'
 		? (enablement ? ContributionEnablementState.EnabledProfile : ContributionEnablementState.DisabledProfile)
@@ -2611,6 +2620,7 @@ function makeInstalledPlugin(name: string, uri: URI, enablement: boolean | Contr
 		override readonly version = constObservable('1.0.0');
 		override readonly enablement = constObservable(enablementState);
 		override readonly policyBlocked = constObservable(policyBlocked);
+		override readonly policyEnablement = constObservable(policyRequired ? true : undefined);
 		override readonly hooks = constObservable([]);
 		override readonly commands = constObservable([
 			{ uri: URI.joinPath(uri, 'commands', `${contributionName}-lookup.md`), name: `${name} lookup`, description: `Search ${name} from chat.` },
@@ -3072,13 +3082,13 @@ function renderEmbeddedPluginDetail(ctx: ComponentFixtureContext, item: IAgentPl
 	}
 }
 
-function makeInstalledPluginItem(name: string, description: string, enablement = ContributionEnablementState.EnabledProfile, policyBlocked = false): IAgentPluginItem {
+function makeInstalledPluginItem(name: string, description: string, enablement = ContributionEnablementState.EnabledProfile, policyBlocked = false, policyRequired = false): IAgentPluginItem {
 	return {
 		kind: AgentPluginItemKind.Installed,
 		name,
 		description,
 		marketplace: 'GitHub',
-		plugin: makeInstalledPlugin(name, URI.file(`/workspace/.copilot/plugins/${name.toLowerCase()}`), enablement, policyBlocked),
+		plugin: makeInstalledPlugin(name, URI.file(`/workspace/.copilot/plugins/${name.toLowerCase()}`), enablement, policyBlocked, policyRequired),
 	};
 }
 
@@ -4119,6 +4129,17 @@ export default defineThemedFixtureGroup({ path: 'chat/aiCustomizations/' }, {
 		}),
 	}),
 
+	DiscoverRequiredPlugin: defineComponentFixture({
+		labels: { kind: 'screenshot', blocksCi: false },
+		expectedVisualDescriptions: ['The Figma plugin required by the organization shows a disabled Uninstall action instead of Retry Uninstall.'],
+		render: ctx => renderEditor(ctx, {
+			sessionResource: localSessionResource,
+			marketplaceVisibilityEnabled: true,
+			discoveryQuery: 'figma',
+			customizationMarketplaceInstallationState: 'requiredPlugin',
+		}),
+	}),
+
 	DiscoverInstallError: defineComponentFixture({
 		labels: { kind: 'screenshot', blocksCi: false },
 		expectedVisualDescriptions: ['The first resource has an installation error and Retry Install action while the remaining Discover results stay available.'],
@@ -4654,6 +4675,12 @@ export default defineThemedFixtureGroup({ path: 'chat/aiCustomizations/' }, {
 	EmbeddedPluginDetailPolicyBlocked: defineComponentFixture({
 		labels: { kind: 'screenshot', blocksCi: false },
 		render: ctx => renderEmbeddedPluginDetail(ctx, makeInstalledPluginItem('Deployment Guard', 'Deployment controls managed by your organization', ContributionEnablementState.DisabledProfile, true)),
+	}),
+
+	EmbeddedPluginDetailRequiredByOrganization: defineComponentFixture({
+		labels: { kind: 'screenshot', blocksCi: false },
+		expectedVisualDescriptions: ['The organization-required plugin detail shows a disabled Uninstall action next to Managed by Organization.'],
+		render: ctx => renderEmbeddedPluginDetail(ctx, makeInstalledPluginItem('Handy Commands', 'Commands required by your organization', ContributionEnablementState.EnabledProfile, false, true)),
 	}),
 
 	// Standalone embedded plugin detail widget — marketplace plugin.

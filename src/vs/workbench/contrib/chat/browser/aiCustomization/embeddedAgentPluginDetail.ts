@@ -419,11 +419,16 @@ export class EmbeddedAgentPluginDetail extends Disposable {
 				}),
 				secondary: true,
 				supportIcons: true,
-				ariaLabel: uninstallAction.label,
+				ariaLabel: uninstallAction.enabled
+					? uninstallAction.label
+					: localize('pluginUninstallUnavailableAria', "{0}. {1}", uninstallAction.label, uninstallAction.tooltip),
 			}));
 			uninstallButton.element.classList.add('embedded-detail-uninstall-button');
 			uninstallButton.label = uninstallAction.label;
 			uninstallButton.enabled = uninstallAction.enabled;
+			if (!uninstallAction.enabled) {
+				this.renderDisposables.add(this.hoverService.setupDelayedHover(uninstallButton.element, { content: uninstallAction.tooltip }, { setupKeyboardEvents: true }));
+			}
 			this.renderDisposables.add(uninstallButton.onDidClick(async () => {
 				try {
 					const removed = await uninstallAction.runAndGetResult();

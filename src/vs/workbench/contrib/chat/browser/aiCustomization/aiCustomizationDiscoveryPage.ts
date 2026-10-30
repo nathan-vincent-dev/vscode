@@ -21,7 +21,7 @@ import { Codicon } from '../../../../../base/common/codicons.js';
 import { structuralEquals } from '../../../../../base/common/equals.js';
 import { getErrorMessage, isCancellationError, onUnexpectedError } from '../../../../../base/common/errors.js';
 import { Disposable, DisposableStore, MutableDisposable } from '../../../../../base/common/lifecycle.js';
-import { autorun } from '../../../../../base/common/observable.js';
+import { autorun, derivedOpts } from '../../../../../base/common/observable.js';
 import { basename, isEqual } from '../../../../../base/common/resources.js';
 import { ScrollbarVisibility } from '../../../../../base/common/scrollable.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
@@ -53,6 +53,7 @@ import { IAgentPluginService } from '../../common/plugins/agentPluginService.js'
 import { PromptsType } from '../../common/promptSyntax/promptTypes.js';
 import { AgentPluginItemKind, IAgentPluginItem } from '../agentPluginEditor/agentPluginItems.js';
 import { MANAGE_PLUGIN_MARKETPLACES_COMMAND_ID } from '../actions/chatPluginActions.js';
+import { getPluginManagedByOrganizationMessage, isPluginRequiredByPolicy } from '../agentPluginActions.js';
 import { IAICustomizationListItem } from './aiCustomizationItemSource.js';
 import { IAICustomizationItemsModel, ITEMS_MODEL_SECTIONS, ItemsModelSection } from './aiCustomizationItemsModel.js';
 import { DELETE_AI_CUSTOMIZATION_ID } from './aiCustomizationManagement.js';
@@ -70,6 +71,10 @@ const catalogPageSize = 24;
 const browseCatalogPageSize = 100;
 const maxFilteredCatalogPagesPerLoad = 8;
 const leadingBrowseItemCount = 4;
+
+function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+	return a.size === b.size && [...a].every(value => b.has(value));
+}
 
 function formatCompactCount(count: number): string {
 	if (count > 1_000_000) {
@@ -432,6 +437,7 @@ function renderRecordedCustomizationActions(
 	name: string,
 	state: RecordedCustomizationMarketplaceInstallState,
 	operationError: string | undefined,
+	uninstallBlockedMessage: string | undefined,
 	disposables: DisposableStore,
 	hoverService: IHoverService,
 	onRepair: () => void,
@@ -455,29 +461,38 @@ function renderRecordedCustomizationActions(
 	}
 
 	const cancellable = isCancellableConnectorOperation(resource, state);
+	const uninstallBlocked = !cancellable && !!uninstallBlockedMessage && (state.kind === 'installed' || state.kind === 'missing' || state.kind === 'error');
 	const button = disposables.add(new Button(container, { ...defaultButtonStyles, secondary: true, small: true }));
 	button.label = cancellable
 		? localize('customizationDiscovery.connectorCancel', "Cancel")
-		: state.kind === 'repairing'
-			? localize('customizationDiscovery.repairingProgress', "Repairing...")
-			: state.kind === 'checking'
-				? localize('customizationDiscovery.checkingProgress', "Checking...")
-				: state.kind === 'uninstalling'
-					? localize('customizationDiscovery.uninstalling', "Uninstalling...")
-					: operationError && state.kind === 'installed'
-						? localize('customizationDiscovery.retryUninstall', "Retry Uninstall")
-						: connector
-							? localize('customizationDiscovery.connectorDisconnect', "Disconnect")
-							: localize('customizationDiscovery.uninstall', "Uninstall");
-	button.enabled = cancellable || state.kind === 'installed' || state.kind === 'missing' || state.kind === 'error';
+		: uninstallBlocked
+			? localize('customizationDiscovery.uninstall', "Uninstall")
+			: state.kind === 'repairing'
+				? localize('customizationDiscovery.repairingProgress', "Repairing...")
+				: state.kind === 'checking'
+					? localize('customizationDiscovery.checkingProgress', "Checking...")
+					: state.kind === 'uninstalling'
+						? localize('customizationDiscovery.uninstalling', "Uninstalling...")
+						: operationError && state.kind === 'installed'
+							? localize('customizationDiscovery.retryUninstall', "Retry Uninstall")
+							: connector
+								? localize('customizationDiscovery.connectorDisconnect', "Disconnect")
+								: localize('customizationDiscovery.uninstall', "Uninstall");
+	button.enabled = !uninstallBlocked && (cancellable || state.kind === 'installed' || state.kind === 'missing' || state.kind === 'error');
 	button.setAriaLabel(cancellable
 		? localize('customizationDiscovery.cancelConnectorRepairLabel', "Cancel reconnecting {0}", name)
-		: connector
-			? localize('customizationDiscovery.disconnectConnectorLabel', "Disconnect {0}", name)
-			: localize('customizationDiscovery.uninstallLabel', "{0} {1}", button.label, name));
+		: uninstallBlocked
+			? localize('customizationDiscovery.uninstallUnavailableLabel', "{0} {1}. {2}", button.label, name, uninstallBlockedMessage)
+			: connector
+				? localize('customizationDiscovery.disconnectConnectorLabel', "Disconnect {0}", name)
+				: localize('customizationDiscovery.uninstallLabel', "{0} {1}", button.label, name));
 	button.element.setAttribute('aria-busy', String(!cancellable && (state.kind === 'uninstalling' || state.kind === 'repairing' || state.kind === 'checking')));
 	disposables.add(DOM.addDisposableListener(button.element, DOM.EventType.CLICK, event => event.stopPropagation()));
 	disposables.add(button.onDidClick(cancellable ? onCancel : onUninstall));
+	if (uninstallBlocked) {
+		disposables.add(hoverService.setupDelayedHover(button.element, { content: uninstallBlockedMessage }, { setupKeyboardEvents: true }));
+		return;
+	}
 	const uninstallError = state.kind === 'error' ? state.message : state.kind === 'installed' ? operationError : undefined;
 	if (uninstallError) {
 		disposables.add(hoverService.setupDelayedHover(button.element, { content: uninstallError }));
@@ -526,6 +541,7 @@ class DiscoveryResultRenderer implements IListRenderer<DiscoveryListEntry, IDisc
 		private readonly onOpenDetails: (resource: ICustomizationMarketplaceResource) => void,
 		private readonly onOpenInstalled: (item: IInstalledDiscoveryItem) => void,
 		private readonly isDirectUninstalling: (item: IInstalledDiscoveryItem) => boolean,
+		private readonly getUninstallBlockedMessage: (item: IInstalledDiscoveryItem) => string | undefined,
 		private readonly onToggleAlternative: (item: IInstalledDiscoveryItem | ICatalogDiscoveryItem) => void,
 		private readonly onRenderAlternative: (item: IInstalledDiscoveryItem | ICatalogDiscoveryItem, disclosure: HTMLButtonElement) => void,
 		private readonly themeService: IThemeService,
@@ -724,6 +740,7 @@ class DiscoveryResultRenderer implements IListRenderer<DiscoveryListEntry, IDisc
 				element.name,
 				state,
 				error,
+				this.getUninstallBlockedMessage(element),
 				templateData.elementDisposables,
 				this.hoverService,
 				() => this.onRepair(element.catalogResource!),
@@ -731,16 +748,22 @@ class DiscoveryResultRenderer implements IListRenderer<DiscoveryListEntry, IDisc
 				() => this.onUninstall(element),
 			);
 		} else if (element.removable) {
-			const uninstalling = this.isDirectUninstalling(element);
+			const uninstallBlockedMessage = this.getUninstallBlockedMessage(element);
+			const uninstalling = !uninstallBlockedMessage && this.isDirectUninstalling(element);
 			const button = templateData.elementDisposables.add(new Button(templateData.actions, { ...defaultButtonStyles, secondary: true, small: true }));
 			button.label = uninstalling
 				? localize('customizationDiscovery.uninstalling', "Uninstalling...")
 				: localize('customizationDiscovery.uninstall', "Uninstall");
-			button.enabled = !uninstalling;
-			button.setAriaLabel(localize('customizationDiscovery.uninstallLabel', "{0} {1}", button.label, element.name));
+			button.enabled = !uninstalling && !uninstallBlockedMessage;
+			button.setAriaLabel(uninstallBlockedMessage
+				? localize('customizationDiscovery.uninstallUnavailableLabel', "{0} {1}. {2}", button.label, element.name, uninstallBlockedMessage)
+				: localize('customizationDiscovery.uninstallLabel', "{0} {1}", button.label, element.name));
 			button.element.setAttribute('aria-busy', String(uninstalling));
 			templateData.elementDisposables.add(DOM.addDisposableListener(button.element, DOM.EventType.CLICK, event => event.stopPropagation()));
 			templateData.elementDisposables.add(button.onDidClick(() => this.onUninstall(element)));
+			if (uninstallBlockedMessage) {
+				templateData.elementDisposables.add(this.hoverService.setupDelayedHover(button.element, { content: uninstallBlockedMessage }, { setupKeyboardEvents: true }));
+			}
 		}
 	}
 
@@ -786,6 +809,15 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 	private readonly pendingInstalls = new Set<string>();
 	private readonly pendingUninstalls = new Set<string>();
 	private readonly pendingDirectUninstalls = new Set<string>();
+	private readonly requiredPluginUris = derivedOpts<ReadonlySet<string>>({ owner: this, equalsFn: setsEqual }, reader => {
+		const uris = new Set<string>();
+		for (const plugin of this.pluginService.plugins.read(reader)) {
+			if (isPluginRequiredByPolicy(plugin, reader)) {
+				uris.add(plugin.uri.toString());
+			}
+		}
+		return uris;
+	});
 	private readonly expandedAlternatives = new Set<string>();
 	private forceMarketplaceRefresh = false;
 	private readonly marketplaceRefreshScheduler = this._register(new RunOnceScheduler(() => {
@@ -924,6 +956,7 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 			resource => this.openMarketplaceItem(resource, 'search'),
 			item => this.openInstalledItem(item),
 			item => this.pendingDirectUninstalls.has(item.id),
+			item => this.getUninstallBlockedMessage(item),
 			item => this.toggleAlternative(item),
 			(item, disclosure) => this.resultAlternativeActions.set(item.id, disclosure),
 			this.themeService,
@@ -977,6 +1010,15 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 			}
 			this.pluginService.plugins.read(reader);
 			this.refreshInstalledItems();
+		}));
+		// Only organizations that require plugins populate this set; it stays empty, and never re-renders, otherwise.
+		let renderedRequiredPluginUris = this.requiredPluginUris.get();
+		this._register(autorun(reader => {
+			const uris = this.requiredPluginUris.read(reader);
+			if (uris !== renderedRequiredPluginUris) {
+				renderedRequiredPluginUris = uris;
+				this.render(true);
+			}
 		}));
 		this._register(this.mcpWorkbenchService.onChange(() => this.refreshInstalledItems()));
 		this._register(this.mcpWorkbenchService.onReset(() => this.refreshInstalledItems()));
@@ -1923,6 +1965,7 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 				item.displayName,
 				state,
 				installError,
+				this.getRequiredPluginMessage(state.target.kind === 'plugin' ? state.target.uri : undefined),
 				this.browseDisposables,
 				this.hoverService,
 				() => void this.repair(item),
@@ -2059,7 +2102,26 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 		}
 	}
 
+	/** Explains why a plugin the organization requires cannot be uninstalled, or `undefined` when it can. */
+	private getRequiredPluginMessage(uri: URI | undefined): string | undefined {
+		return uri && this.requiredPluginUris.get().has(uri.toString()) ? getPluginManagedByOrganizationMessage() : undefined;
+	}
+
+	private getUninstallBlockedMessage(item: IInstalledDiscoveryItem): string | undefined {
+		if (item.type !== 'plugin') {
+			return undefined;
+		}
+		if (item.pluginDetail?.kind === AgentPluginItemKind.Installed) {
+			return this.getRequiredPluginMessage(item.pluginDetail.plugin.uri);
+		}
+		const state = item.catalogResource ? this.getInstallState(item.catalogResource) : undefined;
+		return this.getRequiredPluginMessage(state && hasInstallationTarget(state) && state.target.kind === 'plugin' ? state.target.uri : item.uri);
+	}
+
 	private async uninstall(item: IInstalledDiscoveryItem): Promise<void> {
+		if (this.getUninstallBlockedMessage(item)) {
+			return;
+		}
 		if (!item.catalogResource) {
 			if (this.pendingDirectUninstalls.has(item.id)) {
 				return;
@@ -2114,7 +2176,7 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 		const connector = isCopilotConnectorResource(resource);
 		const resourceKey = getCustomizationMarketplaceResourceKey(resource);
 		const state = this.installService.getInstallState(resource);
-		if (this.pendingUninstalls.has(resourceKey) || state.kind !== 'installed' && state.kind !== 'missing') {
+		if (this.pendingUninstalls.has(resourceKey) || state.kind !== 'installed' && state.kind !== 'missing' || state.target.kind === 'plugin' && this.getRequiredPluginMessage(state.target.uri)) {
 			return;
 		}
 		const query = this.query;
@@ -2246,7 +2308,9 @@ export class AICustomizationDiscoveryPage extends Disposable implements IAICusto
 			const state = entry.catalogResource ? this.getInstallState(entry.catalogResource) : undefined;
 			const stateLabel = state ? getInstallationStateLabel(state, isCopilotConnectorResource(entry.catalogResource)) : localize('customizationDiscovery.installed', "Installed");
 			const stateDetail = state?.kind === 'error' ? localize('customizationDiscovery.verificationErrorDetail', ", {0}", state.message) : '';
-			return localize('customizationDiscovery.installedAriaLabel', "{0}, {1}, {2}{3}{4}. {5}", entry.name, getTypeLabel(entry.type), `${stateLabel}${stateDetail}`, entry.sourceLabel ? localize('customizationDiscovery.sourceAriaLabel', ", source {0}", entry.sourceLabel) : '', entry.disabled ? localize('customizationDiscovery.disabledAriaLabel', ", disabled") : '', entry.description);
+			const label = localize('customizationDiscovery.installedAriaLabel', "{0}, {1}, {2}{3}{4}. {5}", entry.name, getTypeLabel(entry.type), `${stateLabel}${stateDetail}`, entry.sourceLabel ? localize('customizationDiscovery.sourceAriaLabel', ", source {0}", entry.sourceLabel) : '', entry.disabled ? localize('customizationDiscovery.disabledAriaLabel', ", disabled") : '', entry.description);
+			const uninstallBlockedMessage = this.getUninstallBlockedMessage(entry);
+			return uninstallBlockedMessage ? localize('customizationDiscovery.installedManagedAriaLabel', "{0}. {1}", label, uninstallBlockedMessage) : label;
 		}
 		if (entry.linkedConnectionRole === 'alternative' && !entry.alternativeExpanded) {
 			return localize('customizationDiscovery.collapsedAlternativeAriaLabel', "1 alternative customization, collapsed");
